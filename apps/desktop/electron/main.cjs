@@ -30,7 +30,6 @@ const { buildSessionWindowUrl, createSessionWindowRegistry } = require('./sessio
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
-const { PortPool } = require('./port-pool.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
@@ -107,12 +106,6 @@ if (USER_DATA_OVERRIDE) {
   app.setPath('userData', resolvedUserData)
 }
 
-const PORT_FLOOR = 9120
-const PORT_CEILING = 9199
-// In-process port reservations that close the pickPort() TOCTOU window where
-// two concurrent backend spawns could be handed the same port. See
-// port-pool.cjs for the full rationale.
-const portPool = new PortPool(PORT_FLOOR, PORT_CEILING)
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
 const IS_PACKAGED = app.isPackaged
 const IS_MAC = process.platform === 'darwin'
@@ -2446,23 +2439,49 @@ async function ensureRuntime(backend) {
   return backend
 }
 
-function isPortAvailable(port) {
-  return new Promise(resolve => {
-    const server = net.createServer()
-    server.once('error', () => resolve(false))
-    server.once('listening', () => {
-      server.close(() => resolve(true))
-    })
-    server.listen(port, '127.0.0.1')
-  })
-}
+const _READY_RE = /^HERMES_DASHBOARD_READY port=(\d+)/m
 
-async function pickPort() {
-  const port = await portPool.reserve(isPortAvailable)
-  if (port === null) {
-    throw new Error(`No free localhost port in ${PORT_FLOOR}-${PORT_CEILING}`)
-  }
-  return port
+/**
+ * Parse the dashboard's stdout for the `HERMES_DASHBOARD_READY port=<N>`
+ * announcement line that web_server.py prints before entering the event loop.
+ * Returns the port number.  Rejects if the child dies or we time out.
+ */
+function waitForDashboardPort(child, label = 'Hermes backend') {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.stdout.off('data', onData)
+      reject(new Error(`Timed out waiting for ${label} port announcement (45s)`))
+    }, 45_000)
+
+    let buf = ''
+    const onData = (chunk) => {
+      buf += chunk.toString()
+      let nl
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        const m = line.match(_READY_RE)
+        if (m) {
+          clearTimeout(timeout)
+          child.stdout.off('data', onData)
+          resolve(parseInt(m[1], 10))
+          return
+        }
+      }
+    }
+
+    child.stdout.on('data', onData)
+    child.once('exit', (code, signal) => {
+      clearTimeout(timeout)
+      child.stdout.off('data', onData)
+      reject(new Error(`${label}: exited before port announcement (${signal || code})`))
+    })
+    child.once('error', (error) => {
+      clearTimeout(timeout)
+      child.stdout.off('data', onData)
+      reject(error)
+    })
+  })
 }
 
 function fetchJson(url, token, options = {}) {
@@ -4541,25 +4560,14 @@ async function spawnPoolBackend(profile, entry) {
     }
   }
 
-  const port = await pickPort()
   const token = crypto.randomBytes(32).toString('base64url')
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
-  const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
-  let backend
-  let hermesCwd
-  let webDist
-  try {
-    backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
-    hermesCwd = resolveHermesCwd()
-    webDist = resolveWebDist()
-  } catch (error) {
-    // These run before the child exists / its exit handler is attached, so a
-    // throw here would otherwise leak the reservation and slowly exhaust the
-    // 9120-9199 range across switch cycles in one app session.
-    portPool.release(port)
-    throw error
-  }
+  // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+  const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
+  const backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
+  const hermesCwd = resolveHermesCwd()
+  const webDist = resolveWebDist()
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
@@ -4569,13 +4577,8 @@ async function spawnPoolBackend(profile, entry) {
       ...process.env,
       HERMES_HOME,
       ...backend.env,
-      // Pin the gateway's tool/terminal cwd to the same directory we chose for
-      // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
-      // can still point at the install dir even when spawn cwd is home.
       TERMINAL_CWD: hermesCwd,
       HERMES_DASHBOARD_SESSION_TOKEN: token,
-      // Marks this dashboard backend as desktop-spawned so it runs the cron
-      // scheduler tick loop (the gateway isn't running under the app).
       HERMES_DESKTOP: '1',
       HERMES_WEB_DIST: webDist
     },
@@ -4583,7 +4586,6 @@ async function spawnPoolBackend(profile, entry) {
     stdio: ['ignore', 'pipe', 'pipe']
   }))
   entry.process = child
-  entry.port = port
   entry.token = token
 
   child.stdout.on('data', rememberLog)
@@ -4597,19 +4599,21 @@ async function spawnPoolBackend(profile, entry) {
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     backendPool.delete(profile)
-    portPool.release(port)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     backendPool.delete(profile)
-    portPool.release(port)
     if (!ready) {
       rejectStart?.(
         new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`)
       )
     }
   })
+
+  // Discover the ephemeral port the child bound to (announced on stdout).
+  const port = await Promise.race([waitForDashboardPort(child, `profile "${profile}"`), startFailed])
+  entry.port = port
 
   const baseUrl = `http://127.0.0.1:${port}`
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
@@ -4638,7 +4642,6 @@ function stopPoolBackend(profile) {
   const entry = backendPool.get(profile)
   if (!entry) return
   backendPool.delete(profile)
-  if (entry.port) portPool.release(entry.port)
   if (entry.process && !entry.process.killed) {
     try {
       entry.process.kill('SIGTERM')
@@ -4724,10 +4727,9 @@ async function startHermes() {
   }
   if (connectionPromise) return connectionPromise
 
-  // Hoisted so the outer .catch can release a port reserved by pickPort() when
-  // a throw (e.g. ensureRuntime failing) happens before the child's exit
-  // handler is attached. Stays null on the remote path (no port picked).
-  let reservedPort = null
+  // Hoisted so the outer .catch can clean up connectionPromise when a throw
+  // (e.g. ensureRuntime failing) happens before the child's exit handler is
+  // attached. Stays null on the remote path (no child spawned).
 
   connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
@@ -4756,11 +4758,10 @@ async function startHermes() {
       }
     }
 
-    await advanceBootProgress('backend.port', 'Finding an open local port', 16)
-    const port = await pickPort()
-    reservedPort = port
+    await advanceBootProgress('backend.port', 'Resolving Hermes runtime', 16)
     const token = crypto.randomBytes(32).toString('base64url')
-    const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
+    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+    const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
     // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
@@ -4823,7 +4824,6 @@ async function startHermes() {
       )
       hermesProcess = null
       connectionPromise = null
-      portPool.release(port)
       sendBackendExit({ code: null, signal: null, error: error.message })
       rejectBackendStart?.(error)
     })
@@ -4831,7 +4831,6 @@ async function startHermes() {
       rememberLog(`Hermes backend exited (${signal || code})`)
       hermesProcess = null
       connectionPromise = null
-      portPool.release(port)
       sendBackendExit({ code, signal })
       if (!backendReady) {
         const message = `Hermes backend exited before it became ready (${signal || code}).`
@@ -4851,6 +4850,9 @@ async function startHermes() {
         )
       }
     })
+
+    // Discover the ephemeral port the child bound to (announced on stdout).
+    const port = await Promise.race([waitForDashboardPort(hermesProcess, 'Hermes backend'), backendStartFailed])
 
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
@@ -4891,7 +4893,6 @@ async function startHermes() {
       { allowDecrease: true }
     )
     connectionPromise = null
-    portPool.release(reservedPort)
     throw error
   })
 
